@@ -1,0 +1,130 @@
+# ==============================================================================
+# MLOps & Data Engineering Infrastructure (Enterprise / FAANG Standard)
+# Created by IRONKAGE
+# ==============================================================================
+
+# ІЗОЛЬОВАНА МЕРЕЖА: Ніколи не використовуємо дефолтний bridge
+networks:
+  spotify_backend:
+    driver: bridge
+
+# ------------------------------------------------------------------------------
+# 🛠 Базовий шаблон для всіх нод MongoDB
+# ------------------------------------------------------------------------------
+x-mongo-common: &mongo-common
+  image: mongo:8.0.23 # MongoDB: Документоорієнтоване сховище даних, оптимізоване для гнучкості та масштабування
+  restart: unless-stopped
+  command: mongod --replSet spotify_rs --wiredTigerCacheSizeGB 0.5
+  networks:
+    - spotify_backend
+  deploy:
+    resources:
+      limits:
+        memory: 1G
+  # LOG ROTATION: Запобігає падінню сервера через переповнення диска логами
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+  healthcheck:
+    test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+services:
+  # ============================================================================
+  # MONGODB REPLICA SET (High Availability & Transactions)
+  # ============================================================================
+
+  mongo-primary:
+    <<: *mongo-common # Наслідуємо ВСІ базові налаштування
+    container_name: mongo-primary
+    ports:
+      - "127.0.0.1:27017:27017" # Захист для локальної машини
+    volumes:
+      - mongo_primary_data:/data/db
+
+  mongo-sec-1:
+    <<: *mongo-common
+    container_name: mongo-sec-1
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - mongo_sec1_data:/data/db
+
+  mongo-sec-2:
+    <<: *mongo-common
+    container_name: mongo-sec-2
+    ports:
+      - "127.0.0.1:27019:27017"
+    volumes:
+      - mongo_sec2_data:/data/db
+
+  # ============================================================================
+  # CLUSTER INITIALIZER (Автоматизація інфраструктури)
+  # ============================================================================
+  # EPHEMERAL CONTAINER: Одноразовий скрипт, який зшиває 3 ноди в кластер
+  mongo-setup:
+    image: mongo:8.0.23
+    container_name: mongo-setup
+    networks:
+      - spotify_backend
+    depends_on:
+      # Чекаємо повного підняття (healthy) ВСІХ нод, щоб уникнути Race Conditions
+      mongo-primary:
+        condition: service_healthy
+      mongo-sec-1:
+        condition: service_healthy
+      mongo-sec-2:
+        condition: service_healthy
+    command: >
+      mongosh --host mongo-primary:27017 --eval '
+      try {
+        rs.status();
+        print("⚡ Кластер вже налаштований.");
+      } catch (err) {
+        print("⏳ Ініціалізація кластера...");
+        rs.initiate({
+          _id: "spotify_rs",
+          members: [
+            { _id: 0, host: "mongo-primary:27017", priority: 2 },
+            { _id: 1, host: "mongo-sec-1:27017", priority: 1 },
+            { _id: 2, host: "mongo-sec-2:27017", priority: 1 }
+          ]
+        });
+        print("✅ MongoDB Cluster (Replica Set) успішно ініціалізовано!");
+      }'
+
+  # ============================================================================
+  # MONGO EXPRESS (Веб-адмінка) - Доступно за адресою: http://127.0.0.1:8081
+  # ============================================================================
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mongo-express
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks:
+      - spotify_backend
+    depends_on:
+      mongo-primary:
+        condition: service_healthy
+      # Чекаємо, поки скрипт ініціалізації кластера повністю відпрацює!
+      mongo-setup:
+        condition: service_completed_successfully
+    environment:
+      # Замість застарілих SERVER/PORT використовуємо сучасний URL з параметром replicaSet
+      - ME_CONFIG_MONGODB_URL=mongodb://mongo-primary:27017,mongo-sec-1:27017,mongo-sec-2:27017/?replicaSet=spotify_rs
+      - ME_CONFIG_BASICAUTH_USERNAME=${ME_AUTH_USER:-admin}
+      - ME_CONFIG_BASICAUTH_PASSWORD=${ME_AUTH_PASS:-admin}
+      - ME_CONFIG_MONGODB_ENABLE_ADMIN=true
+
+volumes:
+  mongo_primary_data:
+    name: ironkage_mongo_primary
+  mongo_sec1_data:
+    name: ironkage_mongo_sec1
+  mongo_sec2_data:
+    name: ironkage_mongo_sec2
